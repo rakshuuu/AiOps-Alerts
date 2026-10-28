@@ -1,0 +1,189 @@
+import pandas as pd
+from collections import defaultdict, deque
+from datetime import timedelta
+
+
+class AIOpsAlertEngine:
+    def __init__(self, dependency_edges, time_window_minutes=15):
+        """
+        Initialize the AIOps engine with service architecture dependencies.
+        :param dependency_edges: List of tuples representing service flows (e.g., [('DB_Service', 'Auth_Service')])
+        :param time_window_minutes: Window size to cluster cascading alerts
+        """
+        self.time_window = timedelta(minutes=time_window_minutes)
+        
+        # Build a directed adjacency map: each service points to its dependencies.
+        self.dep_graph = defaultdict(set)
+        self.graph_nodes = set()
+        for source, target in dependency_edges:
+            self.dep_graph[source].add(target)
+            self.graph_nodes.update((source, target))
+
+
+        
+
+    def _has_path(self, start, destination):
+        """Return whether a directed path exists between two services."""
+        pending = deque([start])
+        visited = {start}
+        while pending:
+            service = pending.popleft()
+            if service == destination:
+                return True
+            for neighbor in self.dep_graph.get(service, ()):
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    pending.append(neighbor)
+        return False
+
+
+    def correlate_alerts(self, alerts_df):
+
+        """
+        Groups related alerts into a single incident-level view with probable origin highlighted.
+        """
+        alerts_df['timestamp'] = pd.to_datetime(alerts_df['timestamp'])
+        alerts_df = alerts_df.sort_values('timestamp').reset_index(drop=True)
+        
+        incidents = []
+        processed_alert_ids = set()
+        
+        incident_id = 1
+        for idx, row in alerts_df.iterrows():
+            if row['alert_id'] in processed_alert_ids:
+                continue
+                
+            cluster = [row]
+            processed_alert_ids.add(row['alert_id'])
+            
+            window_end = row['timestamp'] + self.time_window
+            
+            # Look ahead for cascading alerts within the time window
+            for jdx, candidate in alerts_df.iloc[idx+1:].iterrows():
+                if candidate['alert_id'] in processed_alert_ids:
+                    continue
+                
+                if candidate['timestamp'] <= window_end:
+                    # Check if services have a topological relationship or are the same service
+                    serv_a = row['service']
+                    serv_b = candidate['service']
+
+                    is_connected = False
+                    if serv_a == serv_b:
+                        is_connected = True
+                    elif self._has_path(serv_a, serv_b) or self._has_path(serv_b, serv_a):
+                        is_connected = True
+                        
+                    if is_connected:
+                        cluster.append(candidate)
+                        processed_alert_ids.add(candidate['alert_id'])
+            
+            # Determine Probable Origin (Root Cause) using topological depth/incoming edges
+            origin_service = self._find_root_cause(cluster)
+            
+            incidents.append({
+                'incident_id': f"INC-{incident_id:03d}",
+                'start_time': cluster[0]['timestamp'],
+                'alert_count': len(cluster),
+                'probable_origin': origin_service,
+                'services_involved': list(set([c['service'] for c in cluster])),
+                'explainability_trail': [f"[{c['timestamp']}] {c['service']} -> {c['message']}" for c in cluster],
+                'raw_alerts': [c['alert_id'] for c in cluster]
+            })
+            incident_id += 1
+            
+        return pd.DataFrame(incidents)
+
+    def _find_root_cause(self, cluster):
+        """
+        Identifies the most upstream service in the dependency graph within the cluster.
+        """
+        services = [c['service'] for c in cluster]
+        service_set = set(services)
+        if not service_set:
+            return None
+
+        # Find services with no incoming dependency edge within this cluster.
+        incoming = {service: 0 for service in service_set}
+        for source in service_set:
+            for target in self.dep_graph.get(source, ()):
+                if target in service_set:
+                    incoming[target] += 1
+
+        root_candidates = [service for service, count in incoming.items() if count == 0]
+        return root_candidates[0] if root_candidates else services[0]
+
+
+    def analyze_dead_weight_alerts(self, alerts_df, historical_incidents_df):
+        """
+        Identifies alerts that have never preceded a real historical incident.
+        """
+        # Get all alert types/signatures linked to historical incidents
+        linked_alert_signatures = set(historical_incidents_df['alert_signature'].unique())
+        
+        # Analyze current alert stream signatures
+        alerts_df['signature'] = alerts_df['service'] + ":" + alerts_df['alert_type']
+        all_signatures = alerts_df['signature'].value_counts().reset_index()
+        all_signatures.columns = ['signature', 'total_firings']
+        
+        # Find dead weights
+        dead_weights = all_signatures[~all_signatures['signature'].isin(linked_alert_signatures)]
+        
+        recommendations = []
+        for _, row in dead_weights.iterrows():
+            recommendations.append({
+                'alert_signature': row['signature'],
+                'firings_count': row['total_firings'],
+                'recommendation': 'DISABLE or INCREASE_THRESHOLD',
+                'reason': 'Fired multiple times historically but never correlated with a verified real incident.'
+            })
+            
+        return pd.DataFrame(recommendations)
+
+# ==========================================
+# TEST / DEMO EXECUTION SCRIPT
+# ==========================================
+if __name__ == "__main__":
+    # 1. Define Service Dependency Map (e.g., DB feeds Backend, Backend feeds Gateway & Frontend)
+    dependency_edges = [
+        ('Database_Primary', 'Auth_Service'),
+        ('Database_Primary', 'Payment_Service'),
+        ('Payment_Service', 'Gateway_API'),
+        ('Auth_Service', 'Gateway_API'),
+        ('Gateway_API', 'Status_Page')
+    ]
+    
+    # 2. Mock Alert Stream (Simulating the 400 alert flood)
+    mock_alerts = pd.DataFrame([
+        {'alert_id': 'ALT-101', 'timestamp': '2026-10-28 10:00:00', 'service': 'Database_Primary', 'alert_type': 'High_CPU', 'message': 'CPU utilization at 98%'},
+        {'alert_id': 'ALT-102', 'timestamp': '2026-10-28 10:01:05', 'service': 'Auth_Service', 'alert_type': 'Latency_Spike', 'message': 'Response time > 2000ms'},
+        {'alert_id': 'ALT-103', 'timestamp': '2026-10-28 10:01:30', 'service': 'Payment_Service', 'alert_type': 'Error_Rate', 'message': '5xx errors spiking'},
+        {'alert_id': 'ALT-104', 'timestamp': '2026-10-28 10:02:00', 'service': 'Gateway_API', 'alert_type': 'Status_Warning', 'message': 'Customer status page warning triggered'},
+        {'alert_id': 'ALT-105', 'timestamp': '2026-10-28 14:30:00', 'service': 'Cache_Redis', 'alert_type': 'Low_Memory', 'message': 'Cache eviction warning (Noisy/Never causes incidents)'},
+    ])
+    
+    # 3. Mock Historical Incidents (Ground Truth for Dead Weight Analysis)
+    mock_historical_incidents = pd.DataFrame({
+        'alert_signature': ['Database_Primary:High_CPU', 'Auth_Service:Latency_Spike']
+    })
+
+    # Initialize Engine
+    engine = AIOpsAlertEngine(dependency_edges, time_window_minutes=15)
+    
+    # Run Correlation
+    print("--- 1. CORRELATED INCIDENTS VIEW ---")
+    consolidated_incidents = engine.correlate_alerts(mock_alerts)
+    for idx, inc in consolidated_incidents.iterrows():
+        print(f"Incident ID: {inc['incident_id']}")
+        print(f"  -> Probable Root Cause Origin: {inc['probable_origin']}")
+        print(f"  -> Consolidated Alert Count: {inc['alert_count']} (Reduced from cascading noise)")
+        print(f"  -> Services Involved: {inc['services_involved']}")
+        print(f"  -> Explainability Log:")
+        for log in inc['explainability_trail']:
+            print(f"     * {log}")
+        print("-" * 50)
+
+    # Run Dead-Weight Noise Analysis
+    print("\n--- 2. NOISE REDUCTION & TUNING RECOMMENDATIONS ---")
+    tuning_recs = engine.analyze_dead_weight_alerts(mock_alerts, mock_historical_incidents)
+    print(tuning_recs.to_string(index=False))
